@@ -190,7 +190,7 @@ jobs:
           persist-credentials: false
 
       - name: Run Slither
-        uses: crytic/slither-action@v0.4.0
+        uses: crytic/slither-action@v0.4.2
         continue-on-error: true      # never block before SARIF upload
         id: slither
         with:
