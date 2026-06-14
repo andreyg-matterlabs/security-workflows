@@ -1,0 +1,331 @@
+# =============================================================================
+# Reusable Workflow: Security Suite (Orchestrator)
+# -----------------------------------------------------------------------------
+# Single entrypoint that repositories call. It:
+#   1. Detects which languages/assets are present (so consumers configure nothing)
+#   2. Fans out to the six component reusable workflows in parallel
+#   3. Aggregates results into the GitHub Step Summary
+#   4. Bundles every report into one "all-security-reports" artifact
+#   5. Enforces the PR quality gate (fail on Critical/High vulns or secrets)
+#
+# Nesting depth: caller (1) -> this orchestrator (2) -> component (3). The
+# GitHub limit is 4, so this is within bounds.
+# =============================================================================
+name: Reusable - Security Suite
+
+on:
+  workflow_call:
+    inputs:
+      # ---- Hard overrides (default 'auto' uses detection) -------------------
+      languages:
+        description: '"auto" or a CSV of: solidity,typescript,javascript,python,rust'
+        type: string
+        default: 'auto'
+      enable_codeql_rust:
+        description: 'CodeQL Rust support is in preview; off by default.'
+        type: boolean
+        default: false
+      # ---- Optional capabilities -------------------------------------------
+      image_ref:
+        description: 'Prebuilt image to scan (e.g. ghcr.io/org/app:sha). Empty = fs scan.'
+        type: string
+        default: ''
+      run_grype:
+        type: boolean
+        default: false
+      iac_strict:
+        type: boolean
+        default: false
+      # ---- Gate tuning ------------------------------------------------------
+      artifact_retention_days:
+        type: number
+        default: 14
+    secrets:
+      semgrep_app_token:
+        required: false
+      registry_token:
+        required: false
+
+# Workflow-level default-deny.
+permissions: {}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. Detect assets in the repository
+  # ---------------------------------------------------------------------------
+  detect:
+    name: Detect languages & assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      has_node: ${{ steps.d.outputs.has_node }}
+      has_python: ${{ steps.d.outputs.has_python }}
+      has_rust: ${{ steps.d.outputs.has_rust }}
+      has_go: ${{ steps.d.outputs.has_go }}
+      has_solidity: ${{ steps.d.outputs.has_solidity }}
+      has_docker: ${{ steps.d.outputs.has_docker }}
+      has_iac: ${{ steps.d.outputs.has_iac }}
+      codeql_languages: ${{ steps.d.outputs.codeql_languages }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Detect
+        id: d
+        env:
+          OVERRIDE: ${{ inputs.languages }}
+          CODEQL_RUST: ${{ inputs.enable_codeql_rust }}
+        run: |
+          set -euo pipefail
+          want() { [ "$OVERRIDE" = "auto" ] && return 0; echo ",$OVERRIDE," | grep -qi ",$1,"; }
+
+          has() { # has <flag> <find-expr...>
+            local name="$1"; shift
+            if [ "$OVERRIDE" != "auto" ]; then
+              if want "$name"; then echo "true"; else echo "false"; fi
+              return
+            fi
+            if find . -path ./.git -prune -o \( "$@" \) -print 2>/dev/null | grep -q .; then
+              echo "true"; else echo "false"; fi
+          }
+
+          HAS_NODE=$(has node -name package.json)
+          HAS_PY=$(has python \( -name 'requirements*.txt' -o -name pyproject.toml -o -name setup.py \))
+          HAS_RUST=$(has rust -name Cargo.toml)
+          HAS_GO=$(has go -name go.mod)
+          HAS_SOL=$(has solidity -name '*.sol')
+          # docker / iac are asset-based, not language overrides
+          if find . -path ./.git -prune -o -iname 'Dockerfile*' -print 2>/dev/null | grep -q .; then HAS_DOCKER=true; else HAS_DOCKER=false; fi
+          if find . -path ./.git -prune -o \( -name '*.tf' -o -name 'Chart.yaml' -o -iname 'Dockerfile*' -o -path '*k8s*' -o -path '*manifests*' \) -print 2>/dev/null | grep -q .; then HAS_IAC=true; else HAS_IAC=false; fi
+
+          # Build CodeQL language array (js/ts + python + go by default; rust opt-in)
+          langs=()
+          [ "$HAS_NODE" = "true" ] && langs+=("javascript-typescript")
+          [ "$HAS_PY" = "true" ] && langs+=("python")
+          [ "$HAS_GO" = "true" ] && langs+=("go")
+          { [ "$HAS_RUST" = "true" ] && [ "$CODEQL_RUST" = "true" ]; } && langs+=("rust")
+          if [ ${#langs[@]} -eq 0 ]; then cq='[]'; else
+            cq=$(printf '"%s",' "${langs[@]}"); cq="[${cq%,}]"; fi
+
+          {
+            echo "has_node=$HAS_NODE"
+            echo "has_python=$HAS_PY"
+            echo "has_rust=$HAS_RUST"
+            echo "has_go=$HAS_GO"
+            echo "has_solidity=$HAS_SOL"
+            echo "has_docker=$HAS_DOCKER"
+            echo "has_iac=$HAS_IAC"
+            echo "codeql_languages=$cq"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 1. SAST
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST
+    needs: detect
+    uses: ./.github/workflows/reusable-sast.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+      packages: read
+    with:
+      codeql_languages: ${{ needs.detect.outputs.codeql_languages }}
+      run_semgrep: true
+      run_slither: ${{ needs.detect.outputs.has_solidity == 'true' }}
+      artifact_retention_days: ${{ inputs.artifact_retention_days }}
+    secrets:
+      semgrep_app_token: ${{ secrets.semgrep_app_token }}
+
+  # ---------------------------------------------------------------------------
+  # 2. SCA
+  # ---------------------------------------------------------------------------
+  sca:
+    name: SCA
+    needs: detect
+    uses: ./.github/workflows/reusable-sca.yml
+    permissions:
+      contents: read
+      security-events: write   # govulncheck SARIF -> Code Scanning
+      actions: read
+      pull-requests: write
+    with:
+      run_node: ${{ needs.detect.outputs.has_node == 'true' }}
+      run_python: ${{ needs.detect.outputs.has_python == 'true' }}
+      run_rust: ${{ needs.detect.outputs.has_rust == 'true' }}
+      run_go: ${{ needs.detect.outputs.has_go == 'true' }}
+      artifact_retention_days: ${{ inputs.artifact_retention_days }}
+
+  # ---------------------------------------------------------------------------
+  # 3. SBOM
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: SBOM
+    uses: ./.github/workflows/reusable-sbom.yml
+    permissions:
+      contents: read
+    with:
+      scan_target: '.'
+      artifact_retention_days: ${{ inputs.artifact_retention_days }}
+
+  # ---------------------------------------------------------------------------
+  # 4. Container security
+  # ---------------------------------------------------------------------------
+  container:
+    name: Container
+    needs: detect
+    if: ${{ needs.detect.outputs.has_docker == 'true' || inputs.image_ref != '' }}
+    uses: ./.github/workflows/reusable-container-scan.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+      packages: read
+    with:
+      image_ref: ${{ inputs.image_ref }}
+      run_grype: ${{ inputs.run_grype }}
+      artifact_retention_days: ${{ inputs.artifact_retention_days }}
+    secrets:
+      registry_token: ${{ secrets.registry_token }}
+
+  # ---------------------------------------------------------------------------
+  # 5. IaC security
+  # ---------------------------------------------------------------------------
+  iac:
+    name: IaC
+    needs: detect
+    if: ${{ needs.detect.outputs.has_iac == 'true' }}
+    uses: ./.github/workflows/reusable-iac-scan.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    with:
+      directory: '.'
+      iac_strict: ${{ inputs.iac_strict }}
+      artifact_retention_days: ${{ inputs.artifact_retention_days }}
+
+  # ---------------------------------------------------------------------------
+  # 6. Summary + Quality Gate
+  # ---------------------------------------------------------------------------
+  summary:
+    name: Summary & Gate
+    if: always()
+    needs: [detect, sast, sca, sbom, container, iac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read            # download-artifact from this run
+    steps:
+      - name: Collect outputs
+        id: collect
+        env:
+          SAST_HIGH: ${{ needs.sast.outputs.total_high }}
+          SCA_CRIT: ${{ needs.sca.outputs.critical }}
+          SCA_HIGH: ${{ needs.sca.outputs.high }}
+          SCA_DEPS: ${{ needs.sca.outputs.vuln_deps }}
+          CON_CRIT: ${{ needs.container.outputs.critical }}
+          CON_HIGH: ${{ needs.container.outputs.high }}
+          IAC_FAILED: ${{ needs.iac.outputs.failed_checks }}
+          IAC_HIGH: ${{ needs.iac.outputs.high }}
+          SBOM_STATUS: ${{ needs.sbom.outputs.status }}
+        run: |
+          # Normalize every value to an integer (skipped jobs emit "")
+          norm() { v="$1"; case "$v" in ''|null) echo 0;; *) echo "$v";; esac; }
+          {
+            echo "sast_high=$(norm "$SAST_HIGH")"
+            echo "sca_crit=$(norm "$SCA_CRIT")"
+            echo "sca_high=$(norm "$SCA_HIGH")"
+            echo "sca_deps=$(norm "$SCA_DEPS")"
+            echo "con_crit=$(norm "$CON_CRIT")"
+            echo "con_high=$(norm "$CON_HIGH")"
+            echo "iac_failed=$(norm "$IAC_FAILED")"
+            echo "iac_high=$(norm "$IAC_HIGH")"
+            echo "sbom_status=${SBOM_STATUS:-skipped}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download all reports
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-reports
+
+      - name: Assemble security-reports/ tree
+        if: always()
+        run: |
+          mkdir -p security-reports/{sast,sca,sbom,containers,iac,summary}
+          cp -r downloaded-reports/sast-*/*            security-reports/sast/       2>/dev/null || true
+          cp -r downloaded-reports/sca-*/*             security-reports/sca/        2>/dev/null || true
+          cp -r downloaded-reports/sbom/*              security-reports/sbom/       2>/dev/null || true
+          cp -r downloaded-reports/container-*/*       security-reports/containers/ 2>/dev/null || true
+          cp -r downloaded-reports/iac-*/*             security-reports/iac/        2>/dev/null || true
+
+      - name: Build Step Summary
+        if: always()
+        run: |
+          SAST=${{ steps.collect.outputs.sast_high }}
+          SCAC=${{ steps.collect.outputs.sca_crit }}
+          SCAH=${{ steps.collect.outputs.sca_high }}
+          SCAD=${{ steps.collect.outputs.sca_deps }}
+          CONC=${{ steps.collect.outputs.con_crit }}
+          CONH=${{ steps.collect.outputs.con_high }}
+          IACF=${{ steps.collect.outputs.iac_failed }}
+          SBOM=${{ steps.collect.outputs.sbom_status }}
+
+          gate_crit=$((SCAC + CONC))
+          gate_high=$((SAST + SCAH + CONH))
+
+          {
+            echo "# 🔐 Security Scan Summary"
+            echo ""
+            echo "| Control | Result |"
+            echo "|---|---|"
+            echo "| SAST (Semgrep/Slither gating findings) | $SAST |"
+            echo "| SCA vulnerable dependencies | $SCAD (crit: $SCAC, high: $SCAH) |"
+            echo "| Container vulnerabilities | crit: $CONC, high: $CONH |"
+            echo "| IaC failed checks | $IACF |"
+            echo "| SBOM generation | $SBOM |"
+            echo ""
+            echo "**Gate inputs →** Critical: \`$gate_crit\` · High: \`$gate_high\`"
+            echo ""
+            echo "## 📦 Artifacts"
+            echo "Download from the run's **Artifacts** section:"
+            echo "- \`all-security-reports\` (full \`security-reports/\` tree)"
+            echo "- \`sast-semgrep-report\`, \`sast-slither-report\`"
+            echo "- \`sca-*-report\`, \`sbom\`, \`container-security-report\`, \`iac-scan-report\`"
+            echo ""
+            echo "SARIF results are also available under the repository **Security → Code scanning** tab."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined artifact bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-security-reports
+          path: security-reports/
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
+
+      - name: Enforce quality gate
+        if: always()
+        run: |
+          SAST=${{ steps.collect.outputs.sast_high }}
+          SCAC=${{ steps.collect.outputs.sca_crit }}
+          SCAH=${{ steps.collect.outputs.sca_high }}
+          CONC=${{ steps.collect.outputs.con_crit }}
+          CONH=${{ steps.collect.outputs.con_high }}
+
+          gate_crit=$((SCAC + CONC))
+          gate_high=$((SAST + SCAH + CONH))
+
+          fail=0
+          if [ "$gate_crit" -gt 0 ]; then echo "::error::$gate_crit CRITICAL finding(s) detected"; fail=1; fi
+          if [ "$gate_high" -gt 0 ]; then echo "::error::$gate_high HIGH finding(s) detected"; fail=1; fi
+
+          if [ "$fail" -eq 1 ]; then
+            echo "Quality gate FAILED — see summary above."
+            exit 1
+          fi
+          echo "Quality gate PASSED (no Critical/High vulnerabilities)."
