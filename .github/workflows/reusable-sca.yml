@@ -68,10 +68,10 @@ jobs:
       critical: ${{ steps.audit.outputs.critical }}
       high: ${{ steps.audit.outputs.high }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: { persist-credentials: false }
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
 
@@ -102,7 +102,7 @@ jobs:
           echo "critical=${crit:-0}" >> "$GITHUB_OUTPUT"
           echo "high=${high:-0}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: sca-node-report
@@ -123,10 +123,10 @@ jobs:
       critical: ${{ steps.audit.outputs.critical }}
       high: ${{ steps.audit.outputs.high }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: { persist-credentials: false }
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -148,7 +148,7 @@ jobs:
           echo "critical=0" >> "$GITHUB_OUTPUT"
           echo "high=${vulns:-0}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: sca-python-report
@@ -169,7 +169,7 @@ jobs:
       critical: ${{ steps.audit.outputs.critical }}
       high: ${{ steps.audit.outputs.high }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: { persist-credentials: false }
 
       - uses: dtolnay/rust-toolchain@stable
@@ -187,7 +187,7 @@ jobs:
           echo "critical=0" >> "$GITHUB_OUTPUT"
           echo "high=${n:-0}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: sca-rust-report
@@ -210,10 +210,10 @@ jobs:
       critical: ${{ steps.audit.outputs.critical }}
       high: ${{ steps.audit.outputs.high }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: { persist-credentials: false }
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: 'stable'
 
@@ -240,12 +240,12 @@ jobs:
 
       - name: Upload SARIF to Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: go-vuln.sarif
           category: govulncheck
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: sca-go-report
@@ -267,11 +267,11 @@ jobs:
       contents: read
       pull-requests: write   # post the summary comment on the PR
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: { persist-credentials: false }
 
       - name: Dependency Review
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           # Gate handled centrally; surface but don't hard-fail here.
           fail-on-severity: critical
