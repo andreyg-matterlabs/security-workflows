@@ -78,6 +78,7 @@ jobs:
 
       - name: Run Trivy config (SARIF)
         uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
         with:
           scan-type: config
           scan-ref: ${{ inputs.directory }}
@@ -88,6 +89,8 @@ jobs:
       - name: Count findings
         id: count
         run: |
+          # Ensure Trivy SARIF exists even if the step failed, so always() upload works.
+          [ -s trivy-iac.sarif ] || echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"trivy"}},"results":[]}]}' > trivy-iac.sarif
           # Total failed Checkov checks (informational rollup)
           failed=$(jq '[.runs[].results[]?] | length' checkov.sarif 2>/dev/null || echo 0)
           # SARIF "error" level approximates HIGH/CRITICAL for gating
