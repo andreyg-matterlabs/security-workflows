@@ -79,7 +79,7 @@ jobs:
 
       # ----- Vulns + secrets + misconfig on image or filesystem (SARIF) -----
       - name: Trivy scan - SARIF
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@0.36.0
         env:
           TRIVY_PASSWORD: ${{ secrets.registry_token }}
         with:
@@ -93,7 +93,7 @@ jobs:
 
       # ----- Same scan as JSON (machine-readable counts/artifact) -----
       - name: Trivy scan - JSON
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@0.36.0
         env:
           TRIVY_PASSWORD: ${{ secrets.registry_token }}
         with:
