@@ -73,7 +73,7 @@ jobs:
           cp checkov-out/results_json.json checkov.json 2>/dev/null || echo '{}' > checkov.json
 
       - name: Run Trivy config (SARIF)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           scan-type: config
           scan-ref: ${{ inputs.directory }}
