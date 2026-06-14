@@ -68,7 +68,7 @@ jobs:
       has_iac: ${{ steps.d.outputs.has_iac }}
       codeql_languages: ${{ steps.d.outputs.codeql_languages }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: { persist-credentials: false }
 
       - name: Detect
@@ -248,7 +248,7 @@ jobs:
 
       - name: Download all reports
         if: always()
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: downloaded-reports
 
@@ -301,7 +301,7 @@ jobs:
 
       - name: Upload combined artifact bundle
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: all-security-reports
           path: security-reports/
