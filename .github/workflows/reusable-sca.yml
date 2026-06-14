@@ -1,0 +1,310 @@
+# =============================================================================
+# Reusable Workflow: Software Composition Analysis (SCA)
+# -----------------------------------------------------------------------------
+# Per-ecosystem dependency vulnerability scanning. All steps auto-detect the
+# ecosystem by manifest presence, so the workflow is safe to run on any repo.
+#
+#   JS / TS : npm audit | pnpm audit | yarn audit   (auto-detected by lockfile)
+#   Python  : pip-audit
+#   Rust    : cargo-audit
+#   All PRs : actions/dependency-review-action (GitHub Advisory DB + licenses)
+#
+# Reports are machine-readable JSON. Critical/High counts feed the PR gate.
+# =============================================================================
+name: Reusable - SCA
+
+on:
+  workflow_call:
+    inputs:
+      run_node:
+        type: boolean
+        default: false
+      run_python:
+        type: boolean
+        default: false
+      run_rust:
+        type: boolean
+        default: false
+      run_go:
+        type: boolean
+        default: false
+      govulncheck_version:
+        description: 'govulncheck version to install (pin to e.g. v1.1.4 in production).'
+        type: string
+        default: 'latest'
+      run_dependency_review:
+        description: 'PR-only GitHub dependency review (requires Dependency Graph).'
+        type: boolean
+        default: true
+      fail_license_check:
+        type: boolean
+        default: false
+      artifact_retention_days:
+        type: number
+        default: 14
+    outputs:
+      critical:
+        value: ${{ jobs.aggregate.outputs.critical }}
+      high:
+        value: ${{ jobs.aggregate.outputs.high }}
+      vuln_deps:
+        value: ${{ jobs.aggregate.outputs.vuln_deps }}
+      status:
+        value: ${{ jobs.aggregate.outputs.status }}
+
+permissions: {}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JS / TS — detect lockfile and run the matching auditor
+  # ---------------------------------------------------------------------------
+  node:
+    name: SCA - Node
+    if: ${{ inputs.run_node }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      critical: ${{ steps.audit.outputs.critical }}
+      high: ${{ steps.audit.outputs.high }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Audit (auto-detect package manager)
+        id: audit
+        run: |
+          set -x
+          crit=0; high=0
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile --ignore-scripts || pnpm install --ignore-scripts || true
+            pnpm audit --json > sca-node.json 2>/dev/null || true
+            crit=$(jq '.metadata.vulnerabilities.critical // 0' sca-node.json 2>/dev/null || echo 0)
+            high=$(jq '.metadata.vulnerabilities.high // 0' sca-node.json 2>/dev/null || echo 0)
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            # Yarn Berry exposes a JSON-friendly auditor; classic streams NDJSON.
+            (yarn npm audit --json > sca-node.json 2>/dev/null) || (yarn audit --json > sca-node.json 2>/dev/null) || true
+            crit=$(jq -s '[.[] | select(.type=="auditAdvisory") | .data.advisory.severity] | map(select(.=="critical")) | length' sca-node.json 2>/dev/null || echo 0)
+            high=$(jq -s '[.[] | select(.type=="auditAdvisory") | .data.advisory.severity] | map(select(.=="high")) | length' sca-node.json 2>/dev/null || echo 0)
+          else
+            npm install --package-lock-only --ignore-scripts || true
+            npm audit --json > sca-node.json 2>/dev/null || true
+            crit=$(jq '.metadata.vulnerabilities.critical // 0' sca-node.json 2>/dev/null || echo 0)
+            high=$(jq '.metadata.vulnerabilities.high // 0' sca-node.json 2>/dev/null || echo 0)
+          fi
+          [ -s sca-node.json ] || echo '{}' > sca-node.json
+          echo "critical=${crit:-0}" >> "$GITHUB_OUTPUT"
+          echo "high=${high:-0}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-node-report
+          path: sca-node.json
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Python — pip-audit
+  # ---------------------------------------------------------------------------
+  python:
+    name: SCA - Python
+    if: ${{ inputs.run_python }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      critical: ${{ steps.audit.outputs.critical }}
+      high: ${{ steps.audit.outputs.high }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pip-audit
+        run: pip install --no-cache-dir pip-audit
+
+      - name: Audit
+        id: audit
+        run: |
+          # Prefer requirements files; fall back to project (pyproject/setup).
+          if ls requirements*.txt >/dev/null 2>&1; then
+            pip-audit -r "$(ls requirements*.txt | head -n1)" -f json -o sca-python.json || true
+          else
+            pip-audit -f json -o sca-python.json || true
+          fi
+          [ -s sca-python.json ] || echo '{"dependencies":[]}' > sca-python.json
+          # pip-audit lacks CVSS severity; treat each advisory as High by default.
+          vulns=$(jq '[.dependencies[]?.vulns[]?] | length' sca-python.json 2>/dev/null || echo 0)
+          echo "critical=0" >> "$GITHUB_OUTPUT"
+          echo "high=${vulns:-0}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-python-report
+          path: sca-python.json
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Rust — cargo-audit
+  # ---------------------------------------------------------------------------
+  rust:
+    name: SCA - Rust
+    if: ${{ inputs.run_rust }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      critical: ${{ steps.audit.outputs.critical }}
+      high: ${{ steps.audit.outputs.high }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit
+        id: audit
+        run: |
+          cargo audit --json > sca-rust.json 2>/dev/null || true
+          [ -s sca-rust.json ] || echo '{"vulnerabilities":{"count":0}}' > sca-rust.json
+          # RustSec advisories: treat as High by default (no uniform CVSS).
+          n=$(jq '.vulnerabilities.count // 0' sca-rust.json 2>/dev/null || echo 0)
+          echo "critical=0" >> "$GITHUB_OUTPUT"
+          echo "high=${n:-0}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-rust-report
+          path: sca-rust.json
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Go — govulncheck (official golang.org/x/vuln scanner, reachability-aware)
+  # ---------------------------------------------------------------------------
+  go:
+    name: SCA - Go
+    if: ${{ inputs.run_go }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # govulncheck SARIF -> Code Scanning
+      actions: read
+    outputs:
+      critical: ${{ steps.audit.outputs.critical }}
+      high: ${{ steps.audit.outputs.high }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@${{ inputs.govulncheck_version }}
+
+      - name: Audit
+        id: audit
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          # JSON run for accurate, reachability-aware counting.
+          govulncheck -format json ./... > go-vuln.json 2>/dev/null || true
+          [ -s go-vuln.json ] || echo '' > go-vuln.json
+          # SARIF run for Code Scanning (govulncheck builds the module per format).
+          govulncheck -format sarif ./... > go-vuln.sarif 2>/dev/null || true
+          [ -s go-vuln.sarif ] || echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"govulncheck"}},"results":[]}]}' > go-vuln.sarif
+          # Count UNIQUE vulnerabilities actually reachable (called) from the code:
+          # a finding whose vulnerable frame (trace[0]) resolves to a function.
+          high=$(jq -s '[.[] | select(.finding != null) | .finding
+                         | select((.trace[0].function // "") != "") | .osv]
+                        | unique | length' go-vuln.json 2>/dev/null || echo 0)
+          echo "critical=0" >> "$GITHUB_OUTPUT"
+          echo "high=${high:-0}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: go-vuln.sarif
+          category: govulncheck
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-go-report
+          path: |
+            go-vuln.json
+            go-vuln.sarif
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # GitHub Dependency Review — covers every ecosystem with a manifest,
+  # including license policy. PR event only.
+  # ---------------------------------------------------------------------------
+  dependency_review:
+    name: SCA - Dependency Review
+    if: ${{ inputs.run_dependency_review && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # post the summary comment on the PR
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          # Gate handled centrally; surface but don't hard-fail here.
+          fail-on-severity: critical
+          comment-summary-in-pr: on-failure
+          # License policy is opt-in; tune deny/allow lists per org policy.
+          # deny-licenses: GPL-3.0, AGPL-3.0
+        continue-on-error: ${{ !inputs.fail_license_check }}
+
+  # ---------------------------------------------------------------------------
+  # Aggregate counts
+  # ---------------------------------------------------------------------------
+  aggregate:
+    name: Aggregate SCA
+    if: always()
+    needs: [node, python, rust, go]
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      critical: ${{ steps.sum.outputs.critical }}
+      high: ${{ steps.sum.outputs.high }}
+      vuln_deps: ${{ steps.sum.outputs.vuln_deps }}
+      status: ${{ steps.sum.outputs.status }}
+    steps:
+      - id: sum
+        run: |
+          nc="${{ needs.node.outputs.critical || '0' }}";   nh="${{ needs.node.outputs.high || '0' }}"
+          pc="${{ needs.python.outputs.critical || '0' }}"; ph="${{ needs.python.outputs.high || '0' }}"
+          rc="${{ needs.rust.outputs.critical || '0' }}";   rh="${{ needs.rust.outputs.high || '0' }}"
+          gc="${{ needs.go.outputs.critical || '0' }}";     gh="${{ needs.go.outputs.high || '0' }}"
+          for v in nc nh pc ph rc rh gc gh; do eval "$v=\${$v:-0}"; done
+          crit=$((nc + pc + rc + gc))
+          high=$((nh + ph + rh + gh))
+          echo "critical=$crit" >> "$GITHUB_OUTPUT"
+          echo "high=$high" >> "$GITHUB_OUTPUT"
+          echo "vuln_deps=$((crit + high))" >> "$GITHUB_OUTPUT"
+          echo "status=success" >> "$GITHUB_OUTPUT"

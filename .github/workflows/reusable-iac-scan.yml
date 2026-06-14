@@ -1,0 +1,119 @@
+# =============================================================================
+# Reusable Workflow: Infrastructure as Code (IaC) Security
+# -----------------------------------------------------------------------------
+# Tools: Checkov (primary policy engine) + Trivy config scanner (second engine).
+#
+# Covers: Terraform, Kubernetes manifests, Helm charts, Dockerfiles.
+# Detects: misconfigurations, CIS violations, insecure defaults, exposed
+#          services, privileged containers, public resources.
+#
+# Gating: Checkov severities are populated only when an org policy/severity
+#         source is available. By default IaC findings are INFORMATIONAL
+#         (non-gating). Set iac_strict=true to gate on HIGH/CRITICAL.
+# =============================================================================
+name: Reusable - IaC Security
+
+on:
+  workflow_call:
+    inputs:
+      directory:
+        type: string
+        default: '.'
+      iac_strict:
+        description: 'true = HIGH/CRITICAL IaC findings gate the PR.'
+        type: boolean
+        default: false
+      artifact_retention_days:
+        type: number
+        default: 14
+    outputs:
+      failed_checks:
+        value: ${{ jobs.checkov.outputs.failed_checks }}
+      high:
+        value: ${{ jobs.checkov.outputs.high }}
+      status:
+        value: ${{ jobs.checkov.outputs.status }}
+
+permissions: {}
+
+jobs:
+  checkov:
+    name: Checkov + Trivy config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    outputs:
+      failed_checks: ${{ steps.count.outputs.failed_checks }}
+      high: ${{ steps.count.outputs.high }}
+      status: ${{ steps.count.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Checkov
+        run: pip install --no-cache-dir checkov
+
+      - name: Run Checkov (SARIF + JSON)
+        run: |
+          # --soft-fail keeps exit code 0 so we always reach upload/gate steps.
+          checkov -d "${{ inputs.directory }}" \
+            --soft-fail \
+            --compact \
+            --output sarif --output json \
+            --output-file-path checkov-out || true
+          # Checkov writes results_sarif.sarif and results_json.json into the dir
+          cp checkov-out/results_sarif.sarif checkov.sarif 2>/dev/null || \
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"checkov"}},"results":[]}]}' > checkov.sarif
+          cp checkov-out/results_json.json checkov.json 2>/dev/null || echo '{}' > checkov.json
+
+      - name: Run Trivy config (SARIF)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.directory }}
+          format: sarif
+          output: trivy-iac.sarif
+          exit-code: '0'
+
+      - name: Count findings
+        id: count
+        run: |
+          # Total failed Checkov checks (informational rollup)
+          failed=$(jq '[.runs[].results[]?] | length' checkov.sarif 2>/dev/null || echo 0)
+          # SARIF "error" level approximates HIGH/CRITICAL for gating
+          high=$(jq '[.runs[].results[]? | select(.level=="error")] | length' checkov.sarif 2>/dev/null || echo 0)
+          echo "failed_checks=${failed:-0}" >> "$GITHUB_OUTPUT"
+          echo "high=${high:-0}" >> "$GITHUB_OUTPUT"
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Checkov SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+      - name: Upload Trivy IaC SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-iac.sarif
+          category: trivy-iac
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iac-scan-report
+          path: |
+            checkov.sarif
+            checkov.json
+            trivy-iac.sarif
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn

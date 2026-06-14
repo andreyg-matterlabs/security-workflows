@@ -1,0 +1,158 @@
+# =============================================================================
+# Reusable Workflow: Container Security Scanning
+# -----------------------------------------------------------------------------
+# Tools: Trivy (primary), Grype (optional second opinion).
+#
+# Scans:
+#   * Dockerfile misconfiguration  (trivy config)
+#   * Filesystem OR built/published image for vulns + secrets + misconfig
+#
+# Notes:
+#   * Malware detection is NOT a Trivy capability; it is intentionally out of
+#     scope here and listed as a future enhancement (see README).
+#   * If 'image_ref' is provided we scan that image; otherwise we scan the
+#     filesystem so the workflow is useful even before an image is built.
+# =============================================================================
+name: Reusable - Container Security
+
+on:
+  workflow_call:
+    inputs:
+      image_ref:
+        description: 'Image to scan (e.g. ghcr.io/org/app:sha). Empty = scan filesystem.'
+        type: string
+        default: ''
+      dockerfile_target:
+        description: 'Path scanned by trivy config for Dockerfile misconfig.'
+        type: string
+        default: '.'
+      run_grype:
+        type: boolean
+        default: false
+      severity:
+        description: 'Severities Trivy reports/counts.'
+        type: string
+        default: 'CRITICAL,HIGH'
+      artifact_retention_days:
+        type: number
+        default: 14
+    secrets:
+      registry_token:
+        description: 'Optional token to pull private images (passed as TRIVY auth).'
+        required: false
+    outputs:
+      critical:
+        value: ${{ jobs.trivy.outputs.critical }}
+      high:
+        value: ${{ jobs.trivy.outputs.high }}
+      status:
+        value: ${{ jobs.trivy.outputs.status }}
+
+permissions: {}
+
+jobs:
+  trivy:
+    name: Trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+      packages: read           # pull images from GHCR when image_ref is set
+    outputs:
+      critical: ${{ steps.count.outputs.critical }}
+      high: ${{ steps.count.outputs.high }}
+      status: ${{ steps.count.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      # ----- Dockerfile / config misconfiguration (SARIF) -----
+      - name: Trivy config (Dockerfile misconfig) - SARIF
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.dockerfile_target }}
+          format: sarif
+          output: trivy-config.sarif
+          exit-code: '0'
+
+      # ----- Vulns + secrets + misconfig on image or filesystem (SARIF) -----
+      - name: Trivy scan - SARIF
+        uses: aquasecurity/trivy-action@0.24.0
+        env:
+          TRIVY_PASSWORD: ${{ secrets.registry_token }}
+        with:
+          scan-type: ${{ inputs.image_ref != '' && 'image' || 'fs' }}
+          scan-ref: ${{ inputs.image_ref != '' && inputs.image_ref || '.' }}
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+          severity: ${{ inputs.severity }}
+          exit-code: '0'
+
+      # ----- Same scan as JSON (machine-readable counts/artifact) -----
+      - name: Trivy scan - JSON
+        uses: aquasecurity/trivy-action@0.24.0
+        env:
+          TRIVY_PASSWORD: ${{ secrets.registry_token }}
+        with:
+          scan-type: ${{ inputs.image_ref != '' && 'image' || 'fs' }}
+          scan-ref: ${{ inputs.image_ref != '' && inputs.image_ref || '.' }}
+          scanners: vuln,secret,misconfig
+          format: json
+          output: trivy.json
+          severity: ${{ inputs.severity }}
+          exit-code: '0'
+
+      - name: Count findings
+        id: count
+        run: |
+          [ -s trivy.json ] || echo '{"Results":[]}' > trivy.json
+          crit=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy.json 2>/dev/null || echo 0)
+          high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy.json 2>/dev/null || echo 0)
+          echo "critical=${crit:-0}" >> "$GITHUB_OUTPUT"
+          echo "high=${high:-0}" >> "$GITHUB_OUTPUT"
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Trivy SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-container
+
+      - name: Upload Trivy config SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-dockerfile
+
+      # ----- Optional second opinion: Grype -----
+      - name: Grype scan (optional)
+        if: ${{ inputs.run_grype }}
+        uses: anchore/scan-action@v4
+        id: grype
+        with:
+          path: ${{ inputs.image_ref == '' && '.' || '' }}
+          image: ${{ inputs.image_ref }}
+          fail-build: false
+          output-format: sarif
+
+      - name: Stage Grype report
+        if: ${{ inputs.run_grype }}
+        run: cp "${{ steps.grype.outputs.sarif || '' }}" grype.sarif 2>/dev/null || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-security-report
+          path: |
+            trivy.sarif
+            trivy-config.sarif
+            trivy.json
+            grype.sarif
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn

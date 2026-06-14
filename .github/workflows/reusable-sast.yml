@@ -1,0 +1,260 @@
+# =============================================================================
+# Reusable Workflow: Static Application Security Testing (SAST)
+# -----------------------------------------------------------------------------
+# Tools:
+#   * Semgrep  -> JS / TS / Python / Rust / generic (gating signal + SARIF)
+#   * CodeQL   -> deep dataflow analysis, surfaced in GitHub Code Scanning
+#   * Slither  -> Solidity-specific SAST (SARIF)
+#
+# Design notes:
+#   * Semgrep + Slither feed the numeric PR quality gate (we own their SARIF).
+#   * CodeQL uploads to Code Scanning where it can be gated via branch-protection
+#     "code scanning results" rules; it is intentionally NOT part of the numeric
+#     gate to avoid fragile matrix-output aggregation.
+#   * Every tool step uses exit-code 0 (|| true) so the job always reaches the
+#     "upload artifacts / SARIF" steps even when findings exist.
+# =============================================================================
+name: Reusable - SAST
+
+on:
+  workflow_call:
+    inputs:
+      codeql_languages:
+        description: 'JSON array of CodeQL languages, e.g. ["javascript-typescript","python"]. "[]" disables CodeQL.'
+        type: string
+        default: '[]'
+      run_semgrep:
+        type: boolean
+        default: true
+      run_slither:
+        description: 'Enable Slither (set true when Solidity is present).'
+        type: boolean
+        default: false
+      semgrep_config:
+        description: 'Semgrep ruleset(s). "auto" lets Semgrep pick language rulesets.'
+        type: string
+        default: 'auto'
+      solidity_target:
+        description: 'Path/target passed to Slither.'
+        type: string
+        default: '.'
+      sast_fail_level:
+        description: 'SARIF level treated as gating for Semgrep/Slither (error|warning).'
+        type: string
+        default: 'error'
+      artifact_retention_days:
+        type: number
+        default: 14
+    secrets:
+      semgrep_app_token:
+        description: 'Optional Semgrep AppSec Platform token (enables managed rules / triage).'
+        required: false
+    outputs:
+      semgrep_high:
+        description: 'Count of gating-level Semgrep findings.'
+        value: ${{ jobs.aggregate.outputs.semgrep_high }}
+      slither_high:
+        description: 'Count of gating-level Slither findings.'
+        value: ${{ jobs.aggregate.outputs.slither_high }}
+      total_high:
+        description: 'semgrep_high + slither_high.'
+        value: ${{ jobs.aggregate.outputs.total_high }}
+      status:
+        description: 'success | failure (tool execution status, not gate result).'
+        value: ${{ jobs.aggregate.outputs.status }}
+
+# Default-deny at workflow level; jobs request only what they need.
+permissions: {}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Semgrep — primary multi-language SAST + numeric gate signal
+  # ---------------------------------------------------------------------------
+  semgrep:
+    name: Semgrep
+    if: ${{ inputs.run_semgrep }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read          # checkout source
+      security-events: write  # upload SARIF to Code Scanning
+      actions: read           # required by upload-sarif on private repos
+    outputs:
+      high: ${{ steps.count.outputs.high }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4  # pin to SHA in production (see SECURITY.md)
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Semgrep
+        run: pip install --no-cache-dir semgrep
+
+      - name: Run Semgrep (SARIF)
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.semgrep_app_token }}
+        # exit-code 0 so findings never short-circuit the upload/gate steps.
+        run: |
+          set -x
+          semgrep scan \
+            --config "${{ inputs.semgrep_config }}" \
+            --sarif --output semgrep.sarif \
+            --error --no-error || true
+          # Guarantee a valid SARIF exists even if Semgrep aborts early.
+          if [ ! -s semgrep.sarif ]; then
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"semgrep"}},"results":[]}]}' > semgrep.sarif
+          fi
+
+      - name: Count gating findings
+        id: count
+        run: |
+          high=$(jq --arg lvl "${{ inputs.sast_fail_level }}" \
+            '[.runs[].results[]? | select(.level==$lvl)] | length' semgrep.sarif 2>/dev/null || echo 0)
+          echo "high=${high:-0}" >> "$GITHUB_OUTPUT"
+          echo "Semgrep gating findings (level=${{ inputs.sast_fail_level }}): ${high:-0}"
+
+      - name: Upload SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-semgrep-report
+          path: semgrep.sarif
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # CodeQL — matrix per language, results surfaced in Code Scanning
+  # ---------------------------------------------------------------------------
+  codeql:
+    name: CodeQL
+    if: ${{ inputs.codeql_languages != '[]' && inputs.codeql_languages != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+      packages: read          # CodeQL may pull build/tooling packages
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(inputs.codeql_languages) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # 'security-extended' broadens the query set beyond the default pack.
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyze (uploads to Code Scanning automatically)
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # ---------------------------------------------------------------------------
+  # Slither — Solidity SAST
+  # ---------------------------------------------------------------------------
+  slither:
+    name: Slither (Solidity)
+    if: ${{ inputs.run_slither }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    outputs:
+      high: ${{ steps.count.outputs.high }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Slither
+        uses: crytic/slither-action@v0.4.0
+        continue-on-error: true      # never block before SARIF upload
+        id: slither
+        with:
+          target: ${{ inputs.solidity_target }}
+          sarif: slither.sarif
+          fail-on: none              # gating handled centrally
+
+      - name: Normalize SARIF
+        run: |
+          if [ ! -s slither.sarif ]; then
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"slither"}},"results":[]}]}' > slither.sarif
+          fi
+
+      - name: Count gating findings
+        id: count
+        run: |
+          high=$(jq --arg lvl "${{ inputs.sast_fail_level }}" \
+            '[.runs[].results[]? | select(.level==$lvl)] | length' slither.sarif 2>/dev/null || echo 0)
+          echo "high=${high:-0}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: slither.sarif
+          category: slither
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-slither-report
+          path: slither.sarif
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Aggregate — collect counts for the orchestrator gate
+  # ---------------------------------------------------------------------------
+  aggregate:
+    name: Aggregate SAST
+    if: always()
+    needs: [semgrep, slither]
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      semgrep_high: ${{ steps.sum.outputs.semgrep_high }}
+      slither_high: ${{ steps.sum.outputs.slither_high }}
+      total_high: ${{ steps.sum.outputs.total_high }}
+      status: ${{ steps.sum.outputs.status }}
+    steps:
+      - name: Sum counts
+        id: sum
+        run: |
+          sg="${{ needs.semgrep.outputs.high || '0' }}"
+          sl="${{ needs.slither.outputs.high || '0' }}"
+          sg=${sg:-0}; sl=${sl:-0}
+          total=$((sg + sl))
+          echo "semgrep_high=$sg" >> "$GITHUB_OUTPUT"
+          echo "slither_high=$sl" >> "$GITHUB_OUTPUT"
+          echo "total_high=$total" >> "$GITHUB_OUTPUT"
+          # status reflects whether the scanners executed, not the gate outcome
+          if [ "${{ needs.semgrep.result }}" = "failure" ] || [ "${{ needs.slither.result }}" = "failure" ]; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          fi

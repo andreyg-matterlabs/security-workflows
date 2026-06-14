@@ -1,0 +1,74 @@
+# =============================================================================
+# Reusable Workflow: SBOM Generation
+# -----------------------------------------------------------------------------
+# Tool: Syft (anchore/sbom-action). Generates BOTH industry formats:
+#   * CycloneDX JSON  -> sbom.cdx.json
+#   * SPDX JSON        -> sbom.spdx.json
+#
+# SBOMs carry component + license metadata and are non-gating (informational).
+# =============================================================================
+name: Reusable - SBOM
+
+on:
+  workflow_call:
+    inputs:
+      scan_target:
+        description: 'Directory or image to inventory (e.g. "." or "ghcr.io/org/app:tag").'
+        type: string
+        default: '.'
+      artifact_retention_days:
+        type: number
+        default: 14
+    outputs:
+      status:
+        value: ${{ jobs.sbom.outputs.status }}
+
+permissions: {}
+
+jobs:
+  sbom:
+    name: Syft SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.finalize.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ inputs.scan_target }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          # do not auto-publish as a release asset
+          upload-artifact: false
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ inputs.scan_target }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+
+      - name: Finalize
+        id: finalize
+        run: |
+          ok="success"
+          [ -s sbom.cdx.json ] || ok="failure"
+          [ -s sbom.spdx.json ] || ok="failure"
+          echo "status=$ok" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SBOM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
