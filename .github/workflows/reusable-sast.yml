@@ -82,12 +82,12 @@ jobs:
       high: ${{ steps.count.outputs.high }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4  # pin to SHA in production (see SECURITY.md)
+        uses: actions/checkout@v6  # pin to SHA in production (see README: Action versions & pinning)
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -119,14 +119,14 @@ jobs:
 
       - name: Upload SARIF to Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep
 
       - name: Upload SARIF artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sast-semgrep-report
           path: semgrep.sarif
@@ -151,22 +151,22 @@ jobs:
         language: ${{ fromJSON(inputs.codeql_languages) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           # 'security-extended' broadens the query set beyond the default pack.
           queries: security-extended
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+        uses: github/codeql-action/autobuild@v4
 
       - name: Analyze (uploads to Code Scanning automatically)
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
 
@@ -185,7 +185,7 @@ jobs:
       high: ${{ steps.count.outputs.high }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -213,14 +213,14 @@ jobs:
 
       - name: Upload SARIF to Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: slither.sarif
           category: slither
 
       - name: Upload SARIF artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sast-slither-report
           path: slither.sarif
