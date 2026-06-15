@@ -1,23 +1,6 @@
-# =============================================================================
-# Reusable Workflow: Container Security Scanning
-# -----------------------------------------------------------------------------
-# Tools: Trivy (primary), Grype (optional second opinion).
-#
-# SECURITY NOTE: aquasecurity/trivy-action was compromised in a supply-chain
-# attack (Mar 2026). v0.36.0 is post-incident and the repo now uses GitHub
-# immutable releases, but best practice is still to pin to a full commit SHA.
-# Verify the SHA at https://github.com/aquasecurity/trivy-action/releases.
-#
 # Scans:
 #   * Dockerfile misconfiguration  (trivy config)
 #   * Filesystem OR built/published image for vulns + secrets + misconfig
-#
-# Notes:
-#   * Malware detection is NOT a Trivy capability; it is intentionally out of
-#     scope here and listed as a future enhancement (see README).
-#   * If 'image_ref' is provided we scan that image; otherwise we scan the
-#     filesystem so the workflow is useful even before an image is built.
-# =============================================================================
 name: Reusable - Container Security
 
 on:
