@@ -27,7 +27,7 @@ textsecurity-reports/
 
 2. Reusable workflow architecture
 
-textPR to main/master
+text PR to main/master
    │
    ▼
 security-pr.yml  (caller, in app repo)         depth 1
@@ -44,11 +44,3 @@ reusable-security-suite.yml  (orchestrator)    depth 2
    │
    └── summary    → Step Summary + all-security-reports bundle + QUALITY GATE
 
-GitHub allows reusable-workflow nesting up to 4 levels; this design uses 3,
-leaving headroom. Each component workflow is independently callable, so teams can
-also invoke just reusable-sca.yml in isolation if needed.
-
-Why an orchestrator instead of the caller calling each workflow directly?
-It keeps the consumer file truly lightweight, centralizes detection and the gate
-logic in one place, and lets the summary job aggregate every component's outputs
-into one decision and one artifact bundle.
