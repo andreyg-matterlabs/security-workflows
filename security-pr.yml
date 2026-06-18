@@ -1,0 +1,44 @@
+# =============================================================================
+# Caller Workflow: Security (PR)
+# -----------------------------------------------------------------------------
+# Drop this into EACH application repository at:
+#   .github/workflows/security-pr.yml
+# =============================================================================
+name: Security (PR)
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+
+# Default-deny at the top level; the calling job grants the minimal superset
+# required by the reusable suite (intersection rules apply downstream).
+permissions: {}
+
+# One in-flight run per PR; new pushes cancel the previous run.
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    name: Security Suite
+    uses: andreyg-matterlabs/security-workflows/.github/workflows/reusable-security-suite.yml@main
+    permissions:
+      contents: read          # checkout
+      security-events: write  # upload SARIF to Code Scanning
+      actions: read           # SARIF upload + same-run artifact download
+      packages: read          # pull container images (GHCR) when scanned
+      pull-requests: write     # dependency-review PR comment
+    with:
+      languages: 'auto'                 # or e.g. 'typescript,python,go,solidity'
+      enable_codeql_rust: false         # CodeQL Rust is in preview (Go is GA)
+      image_ref: ''                     # set to a prebuilt image to scan it
+      run_grype: false
+      iac_strict: false
+      artifact_retention_days: 14
+   #Optional
+    secrets:
+      semgrep_app_token: ${{ secrets.SEMGREP_APP_TOKEN }}
+      registry_token: ${{ secrets.GITHUB_TOKEN }}
